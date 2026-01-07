@@ -1,12 +1,11 @@
 /*
- * Natatometer - Simulated IMU Test
+ * Natatometer - Simulated IMU Test v2
  * 
- * Tests the velocity integration and feedback algorithm
- * using simulated accelerometer data (no hardware needed).
+ * Tests pace feedback algorithm using acceleration RMS as speed proxy.
+ * (HP-filtered velocity doesn't work because it removes the DC component
+ * which IS the average velocity we're trying to measure!)
  * 
- * Simulates a walking pattern:
- *   - Acceleration pulses mimicking footsteps
- *   - Varying pace (fast/normal/slow)
+ * Real-time approach: Faster walking = stronger push-offs = higher accel RMS
  * 
  * Wiring:
  *   Speaker + -> GPIO 25
@@ -16,42 +15,43 @@
 #define BUZZER_PIN 25
 #define LED_PIN 2
 
-// ============== VELOCITY TRACKING ==============
-float velocity = 0.0;          // Current integrated velocity (m/s)
-float velocityFiltered = 0.0;  // High-pass filtered velocity
-float targetVelocity = 1.4;    // Target walking speed (m/s)
+// ============== PACE DETECTION ==============
+float accelRMS = 0.0;           // Rolling RMS of acceleration
+float targetRMS = 2.0;          // Target RMS for normal pace (~2 m/s² for 1.4 m/s walk)
 
-// High-pass filter state
-float hpFilterAlpha = 0.95;    // ~0.25 Hz cutoff at 100 Hz sample rate
-float lastVelocity = 0.0;
-float lastFilteredVelocity = 0.0;
+// Exponential moving average for RMS
+float rmsAlpha = 0.1;           // Smoothing factor (lower = smoother)
+float accelSquaredAvg = 0.0;    // Running average of accel²
 
 // ============== FEEDBACK THRESHOLDS ==============
-float fastThreshold = 0.1;     // +10% above target = FAST
-float slowThreshold = -0.1;    // -10% below target = SLOW
+float fastThreshold = 1.15;     // 15% above target RMS = FAST
+float slowThreshold = 0.85;     // 15% below target RMS = SLOW
 
 // ============== TIMING ==============
 unsigned long lastSampleTime = 0;
 unsigned long lastFeedbackTime = 0;
+unsigned long lastDebugTime = 0;
 unsigned long simulationStartTime = 0;
 #define SAMPLE_RATE_MS 10         // 100 Hz sampling
 #define FEEDBACK_INTERVAL_MS 500  // Min time between feedback beeps
+#define DEBUG_INTERVAL_MS 200     // Debug output rate
 
 // ============== SIMULATION PARAMETERS ==============
-// Walking cadence: ~2 steps/second = 1 Hz stride frequency
-float strideFrequency = 1.0;      // Hz
+float strideFrequency = 1.0;      // Hz (base)
 float currentPace = 1.0;          // Multiplier: 1.0 = normal, 1.3 = fast, 0.7 = slow
+String currentPhaseName = "NORMAL";
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
   Serial.println("========================================");
-  Serial.println("Natatometer - SIMULATED IMU Test");
+  Serial.println("Natatometer - SIMULATED IMU Test v2");
   Serial.println("========================================");
   Serial.println();
-  Serial.println("This sketch simulates walking acceleration data");
-  Serial.println("to test the velocity algorithm without hardware.");
+  Serial.println("Algorithm: Acceleration RMS as pace proxy");
+  Serial.println("  - Faster walking = stronger push-offs");
+  Serial.println("  - Higher accel RMS = faster pace");
   Serial.println();
   
   pinMode(LED_PIN, OUTPUT);
@@ -63,12 +63,14 @@ void setup() {
   beepReady();
   digitalWrite(LED_PIN, LOW);
   
-  Serial.println("Target velocity: " + String(targetVelocity) + " m/s");
+  Serial.println("Target RMS: " + String(targetRMS) + " m/s^2");
+  Serial.println("Fast threshold: >" + String(targetRMS * fastThreshold, 1) + " m/s^2");
+  Serial.println("Slow threshold: <" + String(targetRMS * slowThreshold, 1) + " m/s^2");
   Serial.println();
-  Serial.println("Simulation phases:");
-  Serial.println("  0-10s:  Normal pace (should be quiet)");
-  Serial.println("  10-20s: Fast pace (expect HIGH beeps)");
-  Serial.println("  20-30s: Slow pace (expect LOW beeps)");
+  Serial.println("Simulation phases (10s each):");
+  Serial.println("  0-10s:  NORMAL pace (should be quiet)");
+  Serial.println("  10-20s: FAST pace (expect HIGH beeps)");
+  Serial.println("  20-30s: SLOW pace (expect LOW beeps)");
   Serial.println("  30s+:   Repeats...");
   Serial.println();
   Serial.println("========================================");
@@ -83,58 +85,53 @@ void loop() {
   
   // Sample at fixed rate
   if (currentTime - lastSampleTime >= SAMPLE_RATE_MS) {
-    float dt = (currentTime - lastSampleTime) / 1000.0;
     lastSampleTime = currentTime;
     
     // Update simulation pace based on time
     updateSimulationPace(currentTime);
     
     // Generate simulated acceleration
-    float accelForward = generateSimulatedAccel(currentTime);
+    float accel = generateSimulatedAccel(currentTime);
     
-    // === CORE ALGORITHM (same as real Natatometer.ino) ===
+    // === CORE ALGORITHM: RMS-based pace detection ===
     
-    // Integrate acceleration to get velocity
-    velocity += accelForward * dt;
+    // Update running average of acceleration squared
+    accelSquaredAvg = rmsAlpha * (accel * accel) + (1.0 - rmsAlpha) * accelSquaredAvg;
     
-    // Apply high-pass filter to remove drift
-    velocityFiltered = hpFilterAlpha * (lastFilteredVelocity + velocity - lastVelocity);
-    lastVelocity = velocity;
-    lastFilteredVelocity = velocityFiltered;
+    // Compute RMS
+    accelRMS = sqrt(accelSquaredAvg);
     
-    // Calculate deviation from target
-    float deviation = velocityFiltered - targetVelocity;
-    float deviationPercent = deviation / targetVelocity;
-    
-    // Provide feedback
+    // Compare to target and provide feedback
     if (currentTime - lastFeedbackTime >= FEEDBACK_INTERVAL_MS) {
-      if (deviationPercent > fastThreshold) {
+      float ratio = accelRMS / targetRMS;
+      
+      if (ratio > fastThreshold) {
         beepFast();
         lastFeedbackTime = currentTime;
-        Serial.println(">>> FAST! v=" + String(velocityFiltered, 2) + " m/s (+" + 
-                       String(deviationPercent * 100, 0) + "%)");
-      } else if (deviationPercent < slowThreshold) {
+        Serial.println(">>> FAST! RMS=" + String(accelRMS, 2) + " m/s^2 (+" + 
+                       String((ratio - 1.0) * 100, 0) + "%)");
+      } else if (ratio < slowThreshold) {
         beepSlow();
         lastFeedbackTime = currentTime;
-        Serial.println(">>> SLOW! v=" + String(velocityFiltered, 2) + " m/s (" + 
-                       String(deviationPercent * 100, 0) + "%)");
+        Serial.println(">>> SLOW! RMS=" + String(accelRMS, 2) + " m/s^2 (" + 
+                       String((ratio - 1.0) * 100, 0) + "%)");
       }
     }
     
-    // Debug output (every 20 samples = 200ms)
-    static int sampleCount = 0;
-    if (++sampleCount >= 20) {
-      sampleCount = 0;
+    // Debug output
+    if (currentTime - lastDebugTime >= DEBUG_INTERVAL_MS) {
+      lastDebugTime = currentTime;
+      float elapsed = (currentTime - simulationStartTime) / 1000.0;
       Serial.print("t=");
-      Serial.print((currentTime - simulationStartTime) / 1000.0, 1);
-      Serial.print("s  pace=");
-      Serial.print(currentPace, 1);
-      Serial.print("x  a=");
-      Serial.print(accelForward, 2);
-      Serial.print("  v_raw=");
-      Serial.print(velocity, 2);
-      Serial.print("  v_filt=");
-      Serial.print(velocityFiltered, 2);
+      Serial.print(elapsed, 1);
+      Serial.print("s  [");
+      Serial.print(currentPhaseName);
+      Serial.print("]  a=");
+      Serial.print(accel, 2);
+      Serial.print("  RMS=");
+      Serial.print(accelRMS, 2);
+      Serial.print("  ratio=");
+      Serial.print(accelRMS / targetRMS, 2);
       Serial.println();
     }
   }
@@ -147,39 +144,32 @@ void updateSimulationPace(unsigned long currentTime) {
   unsigned long elapsed = (currentTime - simulationStartTime) % 30000;
   
   if (elapsed < 10000) {
-    // Normal pace
     currentPace = 1.0;
+    currentPhaseName = "NORMAL";
   } else if (elapsed < 20000) {
-    // Fast pace
     currentPace = 1.3;
+    currentPhaseName = "FAST  ";
   } else {
-    // Slow pace
     currentPace = 0.7;
+    currentPhaseName = "SLOW  ";
   }
 }
 
 float generateSimulatedAccel(unsigned long currentTime) {
-  // Simulate walking acceleration pattern
-  // Walking produces roughly sinusoidal acceleration in forward direction
-  // with peaks during push-off phase
-  
   float t = currentTime / 1000.0;  // Time in seconds
   
-  // Base acceleration pattern: sine wave at stride frequency
-  // Amplitude scaled by pace (faster = harder push-off)
+  // Walking acceleration pattern
+  // Amplitude scales with pace (faster = harder push-off)
   float frequency = strideFrequency * currentPace;
-  float amplitude = 2.0 * currentPace;  // ~2 m/s² peak at normal pace
+  float amplitude = 2.0 * currentPace;  // Key: amplitude proportional to pace!
   
   // Main stride component
   float accel = amplitude * sin(2 * PI * frequency * t);
   
-  // Add some noise (simulates real sensor noise)
-  float noise = (random(-100, 100) / 100.0) * 0.3;  // ±0.3 m/s² noise
+  // Add realistic noise
+  float noise = (random(-100, 100) / 100.0) * 0.3;
   
-  // Add slight bias drift (simulates real IMU drift)
-  float drift = 0.01 * sin(0.05 * t);  // Very slow drift
-  
-  return accel + noise + drift;
+  return accel + noise;
 }
 
 // ============== AUDIO FEEDBACK ==============
@@ -201,12 +191,14 @@ void beepReady() {
 }
 
 void beepFast() {
+  // High pitch = too fast
   tone(BUZZER_PIN, 2000, 100);
   delay(100);
   noTone(BUZZER_PIN);
 }
 
 void beepSlow() {
+  // Low pitch = too slow
   tone(BUZZER_PIN, 800, 200);
   delay(200);
   noTone(BUZZER_PIN);
