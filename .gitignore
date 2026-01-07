@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.bin
+*.map
+
+# Arduino IDE temp files
+*.ino.cpp
+.arduino/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE settings
+.vscode/
+*.code-workspace
+
+# Test data (large CSV files - add specific ones to track if needed)
+test-data/*.csv
+!test-data/.gitkeep
+
+# Backup files
+*~
+*.bak
+*.swp
