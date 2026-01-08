@@ -1,3 +1,9 @@
+# Analysis outputs
+test-data/analysis/
+
+# Keep test-data folder but ignore generated files
+*.png
+
 # Build artifacts
 build/
 *.o
